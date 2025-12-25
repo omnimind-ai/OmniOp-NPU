@@ -1,8 +1,9 @@
 # OmniOp-NPU
 
-**Custom Op library for Qualcomm's Hexagon Tensor Processor**
-
-This is the code repository for the paper [Scaling LLM Test-Time Compute with Mobile NPU on Smartphones](https://arxiv.org/abs/2509.23324). It contains an operator library supporting LLM inference on Qualcomm Hexagon NPU, which needs to be used with the [llama.cpp main repository](https://github.com/haozixu/llama.cpp-npu). This project is primarily a research prototype and is not recommended for production environments.
+This repository provides the operator library required to build and run
+[OmniInfer-VLM](https://github.com/omnimind-ai/OmniInfer-VLM) on Qualcomm Hexagon NPU.
+It focuses on compiling and integrating NPU-accelerated operators for LLM/VLM
+inference on smartphones.
 
 **Hardware requirements**: Android phones with Qualcomm Snapdragon 8 Gen 2 or higher SoC, specifically requiring Hexagon DSP version 73 or above. Note that this implementation relies on **FP16 HMX**, which may not be available on some mid-to-low-end devices.
 
@@ -75,16 +76,3 @@ static HMX_INLINE_ALWAYS void hmx_set_output_scales(const void *scales) {
 ```
 
 **Note that the above information is specific to a particular sequence of HMX instructions. There may be other FP16 HMX instructions that require different data layouts and have functional differences.** There are numerous instruction variants of HMX, and it is difficult for us to associate them with all existing layouts. You can check QNN's `include/QNN/HTP/core/memory_layout.h` and `include/QNN/HTP/core/tile_extract.h` for some information about HMX layouts. If you discover other usable HMX instructions, please feel free to share them with us.
-
-## Citation
-
-If you find our work helpful, please cite us.
-
-```bibtex
-@article{hao2025scaling,
-  title={Scaling LLM Test-Time Compute with Mobile NPU on Smartphones},
-  author={Zixu Hao and Jianyu Wei and Tuowei Wang and Minxing Huang and Huiqiang Jiang and Shiqi Jiang and Ting Cao and Ju Ren},
-  journal={arXiv preprint arXiv:2509.23324},
-  year={2025}
-}
-```
