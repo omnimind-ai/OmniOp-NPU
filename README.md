@@ -1,4 +1,26 @@
-# OmniOp-NPU
+<p align="center">
+  <picture>
+    <img alt="OmniOp" src="./assets/OmniOp-NPU-logo.png" width="60%">
+  </picture>
+</p>
+
+<h3 align="center">
+High-Performance Operators for Qualcomm Hexagon NPU Acceleration
+</h3>
+
+<p align="center">
+| 
+<a href="https://github.com/omnimind-ai/OmniInfer-LLM"><b>OmniInfer-LLM</b></a> 
+| 
+<a href="#compilation"><b>Compilation</b></a> 
+| 
+<a href="#about-fp16-hmx"><b>HMX Technical Details</b></a> 
+| 
+<a href="https://github.com/omnimind-ai/OmniOp-NPU/issues"><b>Issues</b></a> 
+|
+</p>
+
+---
 
 This repository provides the operator library required to build and run
 [OmniInfer-VLM](https://github.com/omnimind-ai/OmniInfer-VLM) on Qualcomm Hexagon NPU.
@@ -76,3 +98,24 @@ static HMX_INLINE_ALWAYS void hmx_set_output_scales(const void *scales) {
 ```
 
 **Note that the above information is specific to a particular sequence of HMX instructions. There may be other FP16 HMX instructions that require different data layouts and have functional differences.** There are numerous instruction variants of HMX, and it is difficult for us to associate them with all existing layouts. You can check QNN's `include/QNN/HTP/core/memory_layout.h` and `include/QNN/HTP/core/tile_extract.h` for some information about HMX layouts. If you discover other usable HMX instructions, please feel free to share them with us.
+
+## Contact Us
+
+For technical inquiries regarding NPU operator implementation, assembly optimization, or bug reports, please reach out via our community channels.
+
+<table>
+  <tr>
+    <td align="center">
+      <img src="./assets/wechat_qr.png" alt="WeChat Group" width="220"/><br/>
+      <b>WeChat Group</b>
+    </td>
+    <td align="center">
+       <a href="https://github.com/omnimind-ai/OmniOp-NPU/issues">
+        <img src="https://img.shields.io/badge/GitHub-Issues-blue?logo=github" alt="GitHub Issues"/>
+      </a><br/>
+      <b>Technical Support</b>
+    </td>
+  </tr>
+</table>
+
+---
