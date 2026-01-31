@@ -103,7 +103,7 @@ static HMX_INLINE_ALWAYS void hmx_set_output_scales(const void *scales) {
 
 For technical inquiries regarding NPU operator implementation, assembly optimization, or bug reports, please reach out via our community channels.
 
-<table>
+<table align="center">
   <tr>
     <td align="center">
       <img src="./assets/wechat_qr.png" alt="WeChat Group" width="220"/><br/>
