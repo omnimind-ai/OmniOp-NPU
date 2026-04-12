@@ -117,7 +117,7 @@ void fa_f16_find_chunk_size(size_t *blk_r, size_t *blk_c, int gqa_factor, int he
                          fa_f16_compute_vtcm_usage);
 }
 
-// #define ENABLE_PROFILE_TIMERS
+#define ENABLE_PROFILE_TIMERS
 
 #if defined(ENABLE_PROFILE_TIMERS)
 
@@ -154,7 +154,7 @@ void simple_flash_attn_f16_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_li
   const bool   has_qk_mask = true;
   const size_t kv_pad_len  = align_up(kv_len, 64);
 
-  const bool enable_vgather_exp = true;   // use table lookup (vgather) to compute exp, experimental
+  const bool enable_vgather_exp = false;   // use table lookup (vgather) to compute exp, experimental
   const bool use_fp32_exp       = false;  // compute FP32 exp
 
   // determine block sizes
@@ -827,6 +827,40 @@ void simple_flash_attn_f16_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_li
          TIMER_US(k_load), TIMER_US(v_load), TIMER_US(qk_dot));
     FARF(ALWAYS, "safe_sm: %lld us, core_acc: %lld us, o_scale: %lld us, o_store: %lld us", TIMER_US(safe_sm),
          TIMER_US(core_acc), TIMER_US(o_scale), TIMER_US(o_store));
+
+    // Write timer to output buffer header (first 10 floats, overwriting valid output)
+    // This is destructive but only used for profiling
+    extern int g_enable_dsp_profiling;
+    if (g_enable_dsp_profiling && kv_head_idx == n_kv_heads - 1) {
+      float *o_f32 = (float *)O;
+      o_f32[0] = 12345.0f;  // magic
+      o_f32[1] = (float)TIMER_US(q_load);
+      o_f32[2] = (float)TIMER_US(k_load);
+      o_f32[3] = (float)TIMER_US(v_load);
+      o_f32[4] = (float)TIMER_US(qk_dot);
+      o_f32[5] = (float)TIMER_US(safe_sm);
+      o_f32[6] = (float)TIMER_US(core_acc);
+      o_f32[7] = (float)TIMER_US(o_scale);
+      o_f32[8] = (float)TIMER_US(o_store);
+      o_f32[9] = o_f32[1]+o_f32[2]+o_f32[3]+o_f32[4]+o_f32[5]+o_f32[6]+o_f32[7]+o_f32[8];
+    }
+
+    // Accumulate timer data into global counters (read by host via test RPC)
+    // Use atomic-like single writer (last kv_head only)
+    if (kv_head_idx == n_kv_heads - 1) {
+      extern volatile int64_t g_fa_timer_q_load, g_fa_timer_k_load, g_fa_timer_v_load;
+      extern volatile int64_t g_fa_timer_qk_dot, g_fa_timer_safe_sm, g_fa_timer_core_acc;
+      extern volatile int64_t g_fa_timer_o_scale, g_fa_timer_o_store, g_fa_timer_count;
+      g_fa_timer_q_load += TIMER_US(q_load);
+      g_fa_timer_k_load += TIMER_US(k_load);
+      g_fa_timer_v_load += TIMER_US(v_load);
+      g_fa_timer_qk_dot += TIMER_US(qk_dot);
+      g_fa_timer_safe_sm += TIMER_US(safe_sm);
+      g_fa_timer_core_acc += TIMER_US(core_acc);
+      g_fa_timer_o_scale += TIMER_US(o_scale);
+      g_fa_timer_o_store += TIMER_US(o_store);
+      g_fa_timer_count++;
+    }
   }
 #endif
 }

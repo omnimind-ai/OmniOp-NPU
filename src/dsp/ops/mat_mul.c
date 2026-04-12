@@ -187,10 +187,10 @@ static void transfer_permuted_weight_chunk_fp16(__fp16 *vtcm_dst, const __fp16 *
   if (use_dma) {
     size_t size = n_cols * k * sizeof(__fp16);
 
-    dma_desc_1d_t desc;
+   static dma_desc_1d_t desc
+        __attribute__((aligned(64)));
     dma_issue_load_from_ddr(&desc, vtcm_dst, src, size);
     dma_wait_for_idle();
-
     return;
   }
 
@@ -299,6 +299,12 @@ static inline HVX_Vector dequantize_single_q8_0_group(const block_q8_0 *group) {
   v_group_hf = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(v_group_hf, v_scales));
   return v_group_hf;
 }
+
+// Reserved for future stage-wise quantization experiments.
+// Previous attempt (skip_weight_scale) abandoned: removing per-group scale
+// produces garbled output because channel magnitudes are lost.
+int g_skip_weight_scale = 0;  // currently unused
+int g_enable_dsp_profiling = 0;  // set via message from host to enable timer output
 
 void dequantize_permuted_weight_q4_0_to_fp16_hvx_task(__fp16 *restrict vtcm_dst, const my_block_q4_0 *restrict src,
                                                       int n_blocks, bool src_in_vtcm, bool is_iq4_nl) {
@@ -928,6 +934,8 @@ int hmx_mat_mul_permuted_qk_0_d16a32(float *restrict dst, const float *restrict 
   const bool use_pipeline = (m >= 128) && (k <= n);
   // const bool use_pipeline = false;
 
+  int64_t activation_load_time = 0, weight_load_time = 0, hmx_core_time = 0, output_store_time = 0;
+
   if (!use_pipeline) {
     // NOTE(hzx): In this simple implementation, load-matmul-store are executed sequentially
     // only DMA load and dequantization process are overlapped during the load stage
@@ -936,14 +944,12 @@ int hmx_mat_mul_permuted_qk_0_d16a32(float *restrict dst, const float *restrict 
       // transfer activation matrix chunk into VTCM
       size_t n_rows = smin(m - mr, m_chunk_n_rows);
 
-      // int64_t act_t0 = HAP_perf_get_qtimer_count();
+      int64_t t0 = g_enable_dsp_profiling ? HAP_perf_get_qtimer_count() : 0;
       {
         const float *activation_chunk = activation + mr * k;
         transfer_activation_chunk_fp32_to_fp16(vtcm_activation, activation_chunk, n_rows, k, k);
       }
-      // activation_load_time += HAP_perf_get_qtimer_count() - act_t0;
-
-      // FARF(ALWAYS, "transfer activation ok, mr = %d, n_rows = %d", mr, n_rows);
+      if (g_enable_dsp_profiling) activation_load_time += HAP_perf_get_qtimer_count() - t0;
 
       void *buf_curr = vtcm_scratch0;
       void *buf_next = vtcm_scratch1;
@@ -962,7 +968,7 @@ int hmx_mat_mul_permuted_qk_0_d16a32(float *restrict dst, const float *restrict 
       for (size_t nc = 0; nc < n; nc += n_chunk_n_cols) {
         size_t n_cols = smin(n - nc, n_chunk_n_cols);
 
-        // int64_t wei_t0 = HAP_perf_get_qtimer_count();
+        t0 = g_enable_dsp_profiling ? HAP_perf_get_qtimer_count() : 0;
         {
           dma_wait_for_idle();  // wait until current weight chunk become ready
 
@@ -982,29 +988,36 @@ int hmx_mat_mul_permuted_qk_0_d16a32(float *restrict dst, const float *restrict 
 
           swap_ptr(&buf_curr, &buf_next);
         }
-        // weight_load_time += HAP_perf_get_qtimer_count() - wei_t0;
+        if (g_enable_dsp_profiling) weight_load_time += HAP_perf_get_qtimer_count() - t0;
 
-        // FARF(ALWAYS, "transfer weight ok, nc = %d, n_cols = %d", nc, n_cols);
-
-        // int64_t core_t0 = HAP_perf_get_qtimer_count();
+        t0 = g_enable_dsp_profiling ? HAP_perf_get_qtimer_count() : 0;
         {
           const int n_row_tiles = ceil_div(n_rows, HMX_FP16_TILE_N_ROWS);
           const int n_col_tiles = ceil_div(n_cols, HMX_FP16_TILE_N_COLS);
           core_dot_chunk_fp16(vtcm_output, vtcm_activation, vtcm_weight, vtcm_scales, n_row_tiles, n_col_tiles, k / 32);
         }
-        // hmx_core_time += HAP_perf_get_qtimer_count() - core_t0;
+        if (g_enable_dsp_profiling) hmx_core_time += HAP_perf_get_qtimer_count() - t0;
 
-        // FARF(ALWAYS, "core compute ok, (%d, %d) tiles", n_row_tiles, n_col_tiles);
-
-        // int64_t out_t0 = HAP_perf_get_qtimer_count();
+        t0 = g_enable_dsp_profiling ? HAP_perf_get_qtimer_count() : 0;
         {
           float *output = dst + (mr * n + nc);
           transfer_output_chunk_fp16_to_fp32(output, vtcm_output, n_rows, n_cols, n);
         }
-        // output_store_time += HAP_perf_get_qtimer_count() - out_t0;
-
-        // FARF(ALWAYS, "transfer output ok, (%d, %d)", mr, nc);
+        if (g_enable_dsp_profiling) output_store_time += HAP_perf_get_qtimer_count() - t0;
       }
+    }
+
+    // Write timer to output header (profiling mode, destructive)
+    if (g_enable_dsp_profiling) {
+      dst[0] = 54321.0f;  // magic
+      dst[1] = (float)HAP_perf_qtimer_count_to_us(activation_load_time);
+      dst[2] = (float)HAP_perf_qtimer_count_to_us(weight_load_time);
+      dst[3] = (float)HAP_perf_qtimer_count_to_us(hmx_core_time);
+      dst[4] = (float)HAP_perf_qtimer_count_to_us(output_store_time);
+      dst[5] = dst[1] + dst[2] + dst[3] + dst[4];
+      dst[6] = (float)m;
+      dst[7] = (float)k;
+      dst[8] = (float)n;
     }
   } else {
     // 4-stage pipeline: DMA load (A), dequantize (B), HMX matmul (C), store (D)
