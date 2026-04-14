@@ -9,7 +9,6 @@ enum HtpOpsIndex {
   HTP_OPS_MAT_MUL_PERMUTED_W8D16A32,
   HTP_OPS_MAT_MUL_PERMUTED_W4D16A32_IQ4_NL,
   HTP_OPS_FLASH_ATTN_QO_F32_KV_F16,
-  HTP_OPS_BENCHMARK_INT8_VS_F16,
   HTP_OPS_COUNT,
 };
 
@@ -32,13 +31,6 @@ struct MatMulParams {
   int32_t m;
   int32_t k;
   int32_t n;
-  int32_t skip_scale;
-} __attribute__((packed));
-
-struct BenchmarkInt8Params {
-  struct RpcmemBufAddr result_buf;
-  int32_t K;
-  int32_t n_iters;
 } __attribute__((packed));
 
 struct FlashAttnParams {

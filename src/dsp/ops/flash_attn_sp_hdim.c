@@ -86,7 +86,7 @@ static void simple_flash_attn_sp_hdim_f16_core(int kv_head_idx, uint8_t *vtcm, u
   const bool   has_qk_mask = (qk_mask != NULL);
   const size_t kv_pad_len  = align_up(kv_len, 64);
 
-  const bool enable_vgather_exp = false;   // use table lookup (vgather) to compute exp, experimental
+  const bool enable_vgather_exp = true;   // use table lookup (vgather) to compute exp, experimental
   const bool use_fp32_exp       = false;  // compute FP32 exp
 
   // determine block sizes

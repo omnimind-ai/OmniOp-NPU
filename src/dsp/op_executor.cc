@@ -46,37 +46,32 @@ enum ggml_type matmul_op_to_weight_type(enum HtpOpsIndex op) {
 
 extern "C" {
 
-#define IN_PTR(i)  (in_bufs[i].ptr)
-#define OUT_PTR(i) (out_bufs[i].ptr)
+#define IN_PTR(i)  std::get<0>(in_bufs[i])
+#define OUT_PTR(i) std::get<0>(out_bufs[i])
 
 int execute_op_simple(struct OpComputeRequest *req) {
-  // Stack-based buffer tracking to avoid heap allocation on hot path
-  struct Buffer { uint8_t *ptr; size_t size; bool cached; };
-  Buffer in_bufs[5] = {}, out_bufs[5] = {};
-  int n_in = 0, n_out = 0;
+  // using FatPointer = std::pair<uint8_t *, size_t>;
+  using Buffer = std::tuple<uint8_t *, size_t, bool>;
+  std::vector<Buffer> in_bufs, out_bufs;
 
-  auto add_in_buffer = [&](const RpcmemBufAddr &buf_addr, size_t size, bool cached = true) {
+  auto add_buffer = [](std::vector<Buffer> &bufs, const RpcmemBufAddr &buf_addr, size_t size, bool cached = true) {
     auto base = reinterpret_cast<uint8_t *>(mmap_manager_get_map(buf_addr.fd));
-    in_bufs[n_in++] = { base ? base + buf_addr.offset : nullptr, size, cached };
-  };
-
-  auto add_out_buffer = [&](const RpcmemBufAddr &buf_addr, size_t size, bool cached = true) {
-    auto base = reinterpret_cast<uint8_t *>(mmap_manager_get_map(buf_addr.fd));
-    out_bufs[n_out++] = { base ? base + buf_addr.offset : nullptr, size, cached };
+    auto ptr  = base != nullptr ? base + buf_addr.offset : nullptr;
+    bufs.push_back({ ptr, size, cached });
   };
 
   auto validate_in_bufs = [&]() {
-    for (int i = 0; i < n_in; ++i) {
-      if (in_bufs[i].ptr && in_bufs[i].cached) {
-        qurt_mem_cache_clean((qurt_addr_t) in_bufs[i].ptr, in_bufs[i].size, QURT_MEM_CACHE_INVALIDATE, QURT_MEM_DCACHE);
+    for (auto [ptr, size, cached] : in_bufs) {
+      if (ptr && cached) {
+        qurt_mem_cache_clean((qurt_addr_t) ptr, size, QURT_MEM_CACHE_INVALIDATE, QURT_MEM_DCACHE);
       }
     }
   };
 
   auto validate_out_bufs = [&]() {
-    for (int i = 0; i < n_out; ++i) {
-      if (out_bufs[i].ptr && out_bufs[i].cached) {
-        qurt_mem_cache_clean((qurt_addr_t) out_bufs[i].ptr, out_bufs[i].size, QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
+    for (auto [ptr, size, cached] : out_bufs) {
+      if (ptr && cached) {
+        qurt_mem_cache_clean((qurt_addr_t) ptr, size, QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
       }
     }
   };
@@ -88,8 +83,8 @@ int execute_op_simple(struct OpComputeRequest *req) {
         auto   params = reinterpret_cast<RmsNormF32Params *>(req->payload);
         size_t size   = params->ne0 * params->ne1 * sizeof(float);
 
-        add_out_buffer(params->dst, size);
-        add_in_buffer(params->src, size);
+        add_buffer(out_bufs, params->dst, size);
+        add_buffer(in_bufs, params->src, size);
 
         validate_in_bufs();
         ret = hvx_rms_norm_f32((float *) OUT_PTR(0), (const float *) IN_PTR(0), params->ne0, params->ne1);
@@ -106,9 +101,9 @@ int execute_op_simple(struct OpComputeRequest *req) {
         size_t activation_size = m * k * sizeof(float);
         size_t weight_size     = k * n * sizeof(__fp16);
 
-        add_out_buffer(params->output, output_size);
-        add_in_buffer(params->activation, activation_size);
-        add_in_buffer(params->weight, weight_size);
+        add_buffer(out_bufs, params->output, output_size);
+        add_buffer(in_bufs, params->activation, activation_size);
+        add_buffer(in_bufs, params->weight, weight_size);
 
         validate_in_bufs();
         ret = hmx_mat_mul_permuted_w16a32((float *) OUT_PTR(0), (float *) IN_PTR(0), (__fp16 *) IN_PTR(1), m, k, n);
@@ -130,17 +125,12 @@ int execute_op_simple(struct OpComputeRequest *req) {
         size_t activation_size = m * k * sizeof(float);
         size_t weight_size     = k * n / QK_K * super_block_size;
 
-        add_out_buffer(params->output, output_size);
-        add_in_buffer(params->activation, activation_size);
-        add_in_buffer(params->weight, weight_size, false);
+        add_buffer(out_bufs, params->output, output_size);
+        add_buffer(in_bufs, params->activation, activation_size);
+        add_buffer(in_bufs, params->weight, weight_size, false);
 
         // int64_t t0 = HAP_perf_get_qtimer_count();
         validate_in_bufs();
-
-        // Stage-wise quantization: set global skip_scale flag from op params
-        extern int g_skip_weight_scale;
-        g_skip_weight_scale = params->skip_scale;
-
         // int64_t t1 = HAP_perf_get_qtimer_count();
         ret =
           hmx_mat_mul_permuted_qk_0_d16a32((float *) OUT_PTR(0), (float *) IN_PTR(0), IN_PTR(1), m, k, n, weight_type);
@@ -172,11 +162,11 @@ int execute_op_simple(struct OpComputeRequest *req) {
         size_t kv_size   = kv_len * n_kv_heads * head_dim * sizeof(__fp16);
         size_t mask_size = qo_len * kv_len * sizeof(__fp16);
 
-        add_out_buffer(params->o, qo_size);
-        add_in_buffer(params->q, qo_size);
-        add_in_buffer(params->k, kv_size);
-        add_in_buffer(params->v, kv_size);
-        add_in_buffer(params->mask, mask_size);
+        add_buffer(out_bufs, params->o, qo_size);
+        add_buffer(in_bufs, params->q, qo_size);
+        add_buffer(in_bufs, params->k, kv_size);
+        add_buffer(in_bufs, params->v, kv_size);
+        add_buffer(in_bufs, params->mask, mask_size);
 
         constexpr bool check_accuracy = false;
 
@@ -204,15 +194,6 @@ int execute_op_simple(struct OpComputeRequest *req) {
                               (__fp16 *) IN_PTR(3), qo_len, kv_len, n_heads, n_kv_heads, head_dim);
           validate_out_bufs();
         }
-      }
-      break;
-
-    case HTP_OPS_BENCHMARK_INT8_VS_F16:
-      {
-        // NOTE: This op requires the result buffer to be pre-mapped via fastrpc_mmap.
-        // Currently only works through the test framework, not via diffusion-cli.
-        // For diffusion-cli, use the auto-benchmark triggered by env var in the matmul path.
-        ret = -1;  // not implemented via message channel yet
       }
       break;
 
