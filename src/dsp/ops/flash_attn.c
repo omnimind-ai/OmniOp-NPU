@@ -154,8 +154,8 @@ void simple_flash_attn_f16_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_li
   const bool   has_qk_mask = true;
   const size_t kv_pad_len  = align_up(kv_len, 64);
 
-  const bool enable_vgather_exp = true;   // use table lookup (vgather) to compute exp, experimental
-  const bool use_fp32_exp       = false;  // compute FP32 exp
+  const bool enable_vgather_exp = false;  // DISABLED: vgather table lookup produces incorrect results on V75
+  const bool use_fp32_exp       = false;  // compute FP32 exp (slower but more accurate)
 
   // determine block sizes
   size_t blk_sz_r, blk_sz_c;  // Br, Bc
