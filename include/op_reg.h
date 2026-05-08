@@ -22,6 +22,7 @@ struct RmsNormF32Params {
   struct RpcmemBufAddr src;
   int32_t       ne0;
   int32_t       ne1;
+  float         eps;
 } __attribute__((packed));
 
 struct MatMulParams {
@@ -39,6 +40,8 @@ struct FlashAttnParams {
   struct RpcmemBufAddr k;
   struct RpcmemBufAddr v;
   struct RpcmemBufAddr mask;
+  float   scale;
+  int32_t mask_stride;
   int32_t qo_len;
   int32_t kv_len;
   int32_t n_heads;

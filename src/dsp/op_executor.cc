@@ -87,7 +87,8 @@ int execute_op_simple(struct OpComputeRequest *req) {
         add_buffer(in_bufs, params->src, size);
 
         validate_in_bufs();
-        ret = hvx_rms_norm_f32((float *) OUT_PTR(0), (const float *) IN_PTR(0), params->ne0, params->ne1);
+        ret = hvx_rms_norm_f32_eps((float *) OUT_PTR(0), (const float *) IN_PTR(0), params->ne0, params->ne1,
+                                   params->eps);
         validate_out_bufs();
       }
       break;
@@ -157,10 +158,12 @@ int execute_op_simple(struct OpComputeRequest *req) {
         int n_heads    = params->n_heads;
         int n_kv_heads = params->n_kv_heads;
         int head_dim   = params->head_dim;
+        float scale    = params->scale;
+        int mask_stride = params->mask_stride;
 
         size_t qo_size   = qo_len * n_heads * head_dim * sizeof(float);
         size_t kv_size   = kv_len * n_kv_heads * head_dim * sizeof(__fp16);
-        size_t mask_size = qo_len * kv_len * sizeof(__fp16);
+        size_t mask_size = qo_len * mask_stride * sizeof(__fp16);
 
         add_buffer(out_bufs, params->o, qo_size);
         add_buffer(in_bufs, params->q, qo_size);
@@ -176,11 +179,12 @@ int execute_op_simple(struct OpComputeRequest *req) {
 
           validate_in_bufs();
           ret = simple_flash_attn((__fp16 *) ref_out, (__fp16 *) IN_PTR(0), (__fp16 *) IN_PTR(1), (__fp16 *) IN_PTR(2),
-                                  (__fp16 *) IN_PTR(3), qo_len, kv_len, n_heads, n_kv_heads, head_dim);
+                                  (__fp16 *) IN_PTR(3), qo_len, kv_len, n_heads, n_kv_heads, head_dim, scale,
+                                  mask_stride);
 
           // check logic
           naive_flash_attn((float *) OUT_PTR(0), (float *) IN_PTR(0), (__fp16 *) IN_PTR(1), (__fp16 *) IN_PTR(2),
-                           (__fp16 *) IN_PTR(3), qo_len, kv_len, n_heads, n_kv_heads, head_dim);
+                           (__fp16 *) IN_PTR(3), qo_len, kv_len, n_heads, n_kv_heads, head_dim, scale, mask_stride);
 
           op_utils::compare_result((float *) OUT_PTR(0), ref_out, qo_size / 4);
 
@@ -191,7 +195,8 @@ int execute_op_simple(struct OpComputeRequest *req) {
           validate_in_bufs();
           ret =
             simple_flash_attn((__fp16 *) OUT_PTR(0), (__fp16 *) IN_PTR(0), (__fp16 *) IN_PTR(1), (__fp16 *) IN_PTR(2),
-                              (__fp16 *) IN_PTR(3), qo_len, kv_len, n_heads, n_kv_heads, head_dim);
+                              (__fp16 *) IN_PTR(3), qo_len, kv_len, n_heads, n_kv_heads, head_dim, scale,
+                              mask_stride);
           validate_out_bufs();
         }
       }

@@ -5,10 +5,7 @@
 #define PREFETCH_SIZE   (8 * 1024)
 #define PREFETCH_N_VECS (PREFETCH_SIZE / VLEN)
 
-void hvx_rms_norm_f32_inner(float *restrict dst, const float *restrict src, int ne0) {
-  // TODO(hzx): make eps an input
-  const float eps = 1e-5;
-
+void hvx_rms_norm_f32_inner(float *restrict dst, const float *restrict src, int ne0, float eps) {
   int n_vecs        = ne0 / 32;
   int leftover      = ne0 & 31;
   int leftover_size = leftover * sizeof(float);
@@ -65,7 +62,7 @@ void hvx_rms_norm_f32_inner(float *restrict dst, const float *restrict src, int 
   }
 }
 
-int hvx_rms_norm_f32(float *restrict dst, const float *restrict src, int ne0, int ne1) {
+int hvx_rms_norm_f32_eps(float *restrict dst, const float *restrict src, int ne0, int ne1, float eps) {
   if (!dst || !src || !ne0 || !ne1) {
     return -1;
   }
@@ -77,8 +74,12 @@ int hvx_rms_norm_f32(float *restrict dst, const float *restrict src, int ne0, in
   for (int j = 0; j < ne1; ++j) {
     float       *output = dst + j * ne0;
     const float *input  = src + j * ne0;
-    hvx_rms_norm_f32_inner(output, input, ne0);
+    hvx_rms_norm_f32_inner(output, input, ne0, eps);
   }
 
   return 0;
+}
+
+int hvx_rms_norm_f32(float *restrict dst, const float *restrict src, int ne0, int ne1) {
+  return hvx_rms_norm_f32_eps(dst, src, ne0, ne1, 1e-5f);
 }

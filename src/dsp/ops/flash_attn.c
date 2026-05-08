@@ -30,6 +30,8 @@ typedef struct {
   __fp16            *O;
   const __fp16      *Q, *K, *V, *mask;
   int                qo_len, kv_len, n_heads, n_kv_heads, head_dim;
+  int                mask_stride;
+  float              scale;
 } simple_fa_task_state_t;
 
 static inline void swap_ptr(__fp16 **p0, __fp16 **p1) {
@@ -76,6 +78,12 @@ size_t fa_f16_compute_vtcm_usage(int gqa_factor, int head_dim, int n_rows, int n
 
 #define MAX_G_BR        256
 #define __vec_aligned__ __attribute__((aligned(VLEN)))
+#define FA_F32_Q_HEAD_GROUP 2
+
+// Gemma4 D=512 global-attention layers are correct on the HMX/F16 core and
+// much faster than the f32 reference core. D=256 SWA layers still need the f32
+// core for correctness.
+#define FA_USE_F32_FOR_HEAD_DIM(head_dim) ((head_dim) != 512)
 
 void find_chunk_size_common(size_t *blk_r, size_t *blk_c, int gqa_factor, int head_dim, int qo_len, int kv_len,
                             size_t limit, int nr_unit, int nc_unit, size_t (*compute_vtcm_usage)(int, int, int, int)) {
@@ -139,7 +147,7 @@ void fa_f16_find_chunk_size(size_t *blk_r, size_t *blk_c, int gqa_factor, int he
 void simple_flash_attn_f16_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_limit, __fp16 *restrict O,
                                 const __fp16 *restrict Q, const __fp16 *restrict K, const __fp16 *restrict V,
                                 const __fp16 *restrict qk_mask, int qo_len, int kv_len, int n_heads, int n_kv_heads,
-                                int head_dim, int worker_index) {
+                                int head_dim, float scale, int mask_stride, int worker_index) {
   // "compile-time" configs
   // TODO: make them real compile-time constants (constexpr or template parameters)
   const int G = n_heads / n_kv_heads;  // GQA factor
@@ -152,7 +160,7 @@ void simple_flash_attn_f16_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_li
   assert(qk_mask != NULL);
   // const bool   has_qk_mask = (qk_mask != NULL);
   const bool   has_qk_mask = true;
-  const size_t kv_pad_len  = align_up(kv_len, 64);
+  const size_t kv_pad_len  = qk_mask ? mask_stride : align_up(kv_len, 64);
 
   const bool enable_vgather_exp = true;   // use table lookup (vgather) to compute exp, experimental
   const bool use_fp32_exp       = false;  // compute FP32 exp
@@ -210,7 +218,7 @@ void simple_flash_attn_f16_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_li
   // end VTCM allocation
   assert(vtcm_cur <= vtcm_limit);
 
-  float  qk_scale    = 1.0f / sqrtf(head_dim) * 1.44269504f;  // log2(e) = 1.44269504
+  float  qk_scale    = scale * 1.44269504f;                   // log2(e) = 1.44269504
   __fp16 qk_scale_hf = (__fp16) qk_scale;                     // NOTE: this conversion can be very slow
 
   // NOTE: there are 32 effective elements in scales, use 4 bytes splat (not Q6_Vh_vsplat_R)
@@ -460,6 +468,10 @@ void simple_flash_attn_f16_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_li
 
                 q_mask_keep0 = Q6_Q_vcmp_gt_VhfVhf(v_mask0, v_fp16_mask_threshold);
                 q_mask_keep1 = Q6_Q_vcmp_gt_VhfVhf(v_mask1, v_fp16_mask_threshold);
+                const size_t ne = smin(n_cols - c, 64);
+                const HVX_VectorPred q_mask_valid = Q6_Q_vsetq2_R(ne * sizeof(__fp16));
+                q_mask_keep0 = Q6_Q_and_QQ(q_mask_keep0, q_mask_valid);
+                q_mask_keep1 = Q6_Q_and_QQ(q_mask_keep1, q_mask_valid);
               } else {
                 const size_t ne = smin(n_cols - c, 64);
 
@@ -856,17 +868,16 @@ void fa_f32_find_chunk_size(size_t *blk_r, size_t *blk_c, int group_size, int he
 void simple_flash_attn_f32_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_limit, __fp16 *restrict O,
                                 const __fp16 *restrict Q, const __fp16 *restrict K, const __fp16 *restrict V,
                                 const __fp16 *restrict qk_mask, int qo_len, int kv_len, int n_heads, int n_kv_heads,
-                                int head_dim) {
-  const int G = n_heads / n_kv_heads;  // group size
+                                int head_dim, float scale, int mask_stride, int q_head_start, int q_head_count) {
+  const int G = q_head_count;  // query heads handled by this task
   const int D = head_dim;
 
   const bool   has_qk_mask = (qk_mask != NULL);
-  const size_t kv_pad_len  = align_up(kv_len, 64);
+  const size_t kv_pad_len  = qk_mask ? mask_stride : align_up(kv_len, 64);
 
-  const float qk_scale = 1.0f / sqrtf(head_dim) * 1.44269504f;
+  const float qk_scale = scale * 1.44269504f;
 
   const size_t qo_ldst_stride = n_heads * head_dim;
-  const size_t qo_ldst_blk_sz = G * head_dim;
   const size_t kv_ld_stride   = n_kv_heads * head_dim;
   const size_t kv_ld_blk_sz   = head_dim;
 
@@ -902,41 +913,17 @@ void simple_flash_attn_f32_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_li
 
     // load [n_rows*G, D] tile of Q into VTCM
     {
-      const float *q_ld_base = ((const float *) Q) + ir * qo_ldst_stride + kv_head_idx * qo_ldst_blk_sz;
+      const float *q_ld_base = ((const float *) Q) + ir * qo_ldst_stride + q_head_start * head_dim;
 
       // l2fetch(q_ld_base, qo_ldst_stride * sizeof(float), qo_ldst_blk_sz * sizeof(float), n_rows, 1);
 
-      // HVX_Vector *pv_out = (HVX_Vector *) q_tile;
-      // for (int r = 0; r < n_rows; ++r) {
-      //   const HVX_Vector *pv_in = (const HVX_Vector *) (q_ld_base + r * qo_ldst_stride);
-      //   for (int gd = 0; gd < G * D; gd += 32) {
-      //     *pv_out++ = *pv_in++;
-      //   }
-      // }
-
-      _Alignas(64) dma_desc_2d_t desc = { 0 };
-
-      desc.next       = 0;  // no next descriptor
-      desc.length     = 0;  // not used
-      desc.type       = DMA_DESC_TYPE_2D;
-      desc.dst_bypass = 0;
-      desc.src_bypass = 1;                        // bypass L2 cache
-      desc.ordered    = 1;                        // ordered, doesn't matter
-      desc.dstate     = DMA_DESC_DSTATE_PENDING;  // to be processed
-
-      desc.src        = (uint32_t) q_ld_base;
-      desc.dst        = (uint32_t) q_tile;
-      desc.roi_width  = qo_ldst_blk_sz * sizeof(float);
-      desc.roi_height = n_rows;
-      desc.src_stride = qo_ldst_stride * sizeof(float);
-      desc.dst_stride = qo_ldst_blk_sz * sizeof(float);
-
-      desc.src_width_offset = 0;
-      desc.dst_width_offset = 0;
-
-      dma_wait_for_idle();
-      dma_submit_one((dma_desc_1d_t *) &desc);
-      dma_wait_for_idle();
+      HVX_Vector *pv_out = (HVX_Vector *) q_tile;
+      for (int r = 0; r < n_rows; ++r) {
+        const HVX_Vector *pv_in = (const HVX_Vector *) (q_ld_base + r * qo_ldst_stride);
+        for (int gd = 0; gd < G * D; gd += 32) {
+          *pv_out++ = *pv_in++;
+        }
+      }
     }
 
     hvx_fill_uw(mvec_m_prev, 0xff7fffff, col_vec_size);
@@ -953,7 +940,6 @@ void simple_flash_attn_f32_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_li
 
         l2fetch(k_ld_base, kv_ld_stride * sizeof(__fp16), kv_ld_blk_sz * sizeof(__fp16), n_cols, 1);
 
-        /*
         HVX_Vector *pv_out = (HVX_Vector *) k_tile;
         for (int c = 0; c < n_cols; ++c) {
           const HVX_Vector *pv_in = (const HVX_Vector *) (k_ld_base + c * kv_ld_stride);
@@ -964,14 +950,6 @@ void simple_flash_attn_f32_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_li
             vp                = Q6_W_vshuff_VVR(Q6_V_hi_W(vp), Q6_V_lo_W(vp), -4);
             *pv_out++         = Q6_V_lo_W(vp);
             *pv_out++         = Q6_V_hi_W(vp);
-          }
-        }
-        */
-
-        // NOTE: This scalar version is slow but more accurate
-        for (int c = 0; c < n_cols; ++c) {
-          for (int d = 0; d < head_dim; ++d) {
-            k_tile[c * head_dim + d] = (float) k_ld_base[c * kv_ld_stride + d];
           }
         }
       }
@@ -995,7 +973,8 @@ void simple_flash_attn_f32_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_li
             for (int c1 = 0; c1 < 32; ++c1) {
               int c = c0 + c1;
               if (c >= n_cols) {
-                break;
+                qk_dot_local[c1] = -INFINITY;
+                continue;
               }
 
               const HVX_Vector *pv_row = (const HVX_Vector *) (q_tile + r * head_dim);
@@ -1110,7 +1089,6 @@ void simple_flash_attn_f32_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_li
       {
         const __fp16 *v_ld_base = V + jc * kv_ld_stride + kv_head_idx * kv_ld_blk_sz;
 
-        /*
         HVX_Vector *pv_out = (HVX_Vector *) v_tile;
         for (int c = 0; c < n_cols; ++c) {
           const HVX_Vector *pv_in = (const HVX_Vector *) (v_ld_base + c * kv_ld_stride);
@@ -1121,14 +1099,6 @@ void simple_flash_attn_f32_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_li
             vp                = Q6_W_vshuff_VVR(Q6_V_hi_W(vp), Q6_V_lo_W(vp), -4);
             *pv_out++         = Q6_V_lo_W(vp);
             *pv_out++         = Q6_V_hi_W(vp);
-          }
-        }
-        */
-
-        // NOTE: This scalar version is slow but more accurate
-        for (int c = 0; c < n_cols; ++c) {
-          for (int d = 0; d < head_dim; ++d) {
-            v_tile[c * head_dim + d] = (float) v_ld_base[c * kv_ld_stride + d];
           }
         }
       }
@@ -1296,7 +1266,7 @@ void simple_flash_attn_f32_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_li
 
     // store [n_rows*G, D] tile of O back to DDR memory
     {
-      float *o_st_base = ((float *) O) + ir * qo_ldst_stride + kv_head_idx * qo_ldst_blk_sz;
+      float *o_st_base = ((float *) O) + ir * qo_ldst_stride + q_head_start * head_dim;
 
       const HVX_Vector *pv_in = (HVX_Vector *) o_tile;
       for (int r = 0; r < n_rows; ++r) {
@@ -1351,8 +1321,20 @@ void simple_flash_attn_worker(void *data, int worker_index) {
     }
 
     int kv_head_idx = task_id;
-    simple_flash_attn_f16_core(kv_head_idx, vtcm, vtcm_limit, s->O, s->Q, s->K, s->V, s->mask, s->qo_len, s->kv_len,
-                               s->n_heads, s->n_kv_heads, s->head_dim, worker_index);
+    if (s->head_dim >= 256 && FA_USE_F32_FOR_HEAD_DIM(s->head_dim)) {
+      const int gqa_factor = s->n_heads / s->n_kv_heads;
+      const int q_head_group = smin(gqa_factor, FA_F32_Q_HEAD_GROUP);
+      const int q_head_idx = task_id * q_head_group;
+      const int q_head_count = smin(q_head_group, s->n_heads - q_head_idx);
+      kv_head_idx = q_head_idx / gqa_factor;
+      simple_flash_attn_f32_core(kv_head_idx, vtcm, vtcm_limit, s->O, s->Q, s->K, s->V, s->mask, s->qo_len,
+                                 s->kv_len, s->n_heads, s->n_kv_heads, s->head_dim, s->scale, s->mask_stride,
+                                 q_head_idx, q_head_count);
+    } else {
+      simple_flash_attn_f16_core(kv_head_idx, vtcm, vtcm_limit, s->O, s->Q, s->K, s->V, s->mask, s->qo_len,
+                                 s->kv_len, s->n_heads, s->n_kv_heads, s->head_dim, s->scale, s->mask_stride,
+                                 worker_index);
+    }
   }
 
   hmx_manager_disable_execution();
@@ -1362,7 +1344,7 @@ void simple_flash_attn_worker(void *data, int worker_index) {
 
 int simple_flash_attn_sp_hdim(__fp16 *restrict O, const __fp16 *restrict Q, const __fp16 *restrict K,
                               const __fp16 *restrict V, const __fp16 *restrict mask, int qo_len, int kv_len,
-                              int n_heads, int n_kv_heads, int head_dim);
+                              int n_heads, int n_kv_heads, int head_dim, float scale, int mask_stride);
 
 /**
  * Simple llama.cpp-style FlashAttention implementation
@@ -1373,9 +1355,11 @@ int simple_flash_attn_sp_hdim(__fp16 *restrict O, const __fp16 *restrict Q, cons
  * mask: [qo_len*, kv_len] broadcast to each head (first dimension maybe larger than qo_len)
  */
 int simple_flash_attn(__fp16 *restrict O, const __fp16 *restrict Q, const __fp16 *restrict K, const __fp16 *restrict V,
-                      const __fp16 *restrict mask, int qo_len, int kv_len, int n_heads, int n_kv_heads, int head_dim) {
+                      const __fp16 *restrict mask, int qo_len, int kv_len, int n_heads, int n_kv_heads, int head_dim,
+                      float scale, int mask_stride) {
   if (head_dim % 64 != 0) {
-    return simple_flash_attn_sp_hdim(O, Q, K, V, mask, qo_len, kv_len, n_heads, n_kv_heads, head_dim);
+    return simple_flash_attn_sp_hdim(O, Q, K, V, mask, qo_len, kv_len, n_heads, n_kv_heads, head_dim, scale,
+                                     mask_stride);
   }
   if (n_heads % n_kv_heads != 0) {
     FARF(ALWAYS, "FA not supported: head_dim=%d n_heads=%d n_kv_heads=%d", head_dim, n_heads, n_kv_heads);
@@ -1397,13 +1381,17 @@ int simple_flash_attn(__fp16 *restrict O, const __fp16 *restrict Q, const __fp16
   state.n_heads    = n_heads;
   state.n_kv_heads = n_kv_heads;
   state.head_dim   = head_dim;
+  state.mask_stride = mask_stride;
+  state.scale      = scale;
 
   // TODO(hzx): parallelize along query_len x n_kv_heads dimension
   // size_t n_tot_chunks      = qo_len * n_kv_heads;
   // size_t n_chunks_per_task = ceil_div(n_tot_chunks, n_workers);
 
   state.task_id              = 0;
-  state.n_tasks              = n_kv_heads;
+  const int gqa_factor       = n_heads / n_kv_heads;
+  const int q_head_group     = smin(gqa_factor, FA_F32_Q_HEAD_GROUP);
+  state.n_tasks              = head_dim >= 256 && FA_USE_F32_FOR_HEAD_DIM(head_dim) ? ceil_div(n_heads, q_head_group) : n_kv_heads;
   state.vtcm_base            = (uint8_t *) vtcm_manager_get_vtcm_base();
   state.vtcm_size_per_thread = vtcm_size_per_thread;
 
@@ -1428,10 +1416,11 @@ int simple_flash_attn(__fp16 *restrict O, const __fp16 *restrict Q, const __fp16
 
 #define Br 32
 #define Bc 256
-#define D  128
+#define D  512
 
 int naive_flash_attn(float *restrict O, const float *restrict Q, const __fp16 *restrict K, const __fp16 *restrict V,
-                     const __fp16 *restrict mask, int qo_len, int kv_len, int n_heads, int n_kv_heads, int head_dim) {
+                     const __fp16 *restrict mask, int qo_len, int kv_len, int n_heads, int n_kv_heads, int head_dim,
+                     float scale, int mask_stride) {
   // 参数校验
   if (n_heads % n_kv_heads != 0) {
     return -1;
@@ -1442,13 +1431,13 @@ int naive_flash_attn(float *restrict O, const float *restrict Q, const __fp16 *r
 
   const int gqa_factor = n_heads / n_kv_heads;
 
-  const size_t kv_pad_len = align_up(kv_len, 64);
+  const size_t kv_pad_len = mask ? mask_stride : align_up(kv_len, 64);
 
   const size_t qo_stride = n_heads * head_dim;
   const size_t kv_stride = n_kv_heads * head_dim;
 
   // 计算特征缩放因子
-  const float qk_scale = 1.0f / sqrtf(head_dim) * 1.44269504f;
+  const float qk_scale = scale * 1.44269504f;
 
   for (int h = 0; h < n_heads; ++h) {
     const int h_kv = h / gqa_factor;
