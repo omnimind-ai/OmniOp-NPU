@@ -80,10 +80,10 @@ size_t fa_f16_compute_vtcm_usage(int gqa_factor, int head_dim, int n_rows, int n
 #define __vec_aligned__ __attribute__((aligned(VLEN)))
 #define FA_F32_Q_HEAD_GROUP 2
 
-// Gemma4 D=512 global-attention layers are correct on the HMX/F16 core and
-// much faster than the f32 reference core. D=256 SWA layers still need the f32
-// core for correctness.
-#define FA_USE_F32_FOR_HEAD_DIM(head_dim) ((head_dim) != 512)
+// Gemma4 D=512 global-attention layers are correct with the fast HMX/F16 path.
+// D=256 SWA layers need fp32 exp inside the HMX/F16 path; the f16/vgather exp
+// variant is not accurate enough for these layers.
+#define FA_USE_F32_FOR_HEAD_DIM(head_dim) ((head_dim) != 256 && (head_dim) != 512)
 
 void find_chunk_size_common(size_t *blk_r, size_t *blk_c, int gqa_factor, int head_dim, int qo_len, int kv_len,
                             size_t limit, int nr_unit, int nc_unit, size_t (*compute_vtcm_usage)(int, int, int, int)) {
@@ -162,8 +162,8 @@ void simple_flash_attn_f16_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_li
   const bool   has_qk_mask = true;
   const size_t kv_pad_len  = qk_mask ? mask_stride : align_up(kv_len, 64);
 
-  const bool enable_vgather_exp = true;   // use table lookup (vgather) to compute exp, experimental
-  const bool use_fp32_exp       = false;  // compute FP32 exp
+  const bool enable_vgather_exp = head_dim != 256;  // use table lookup (vgather) to compute exp, experimental
+  const bool use_fp32_exp       = head_dim == 256;  // compute FP32 exp
 
   // determine block sizes
   size_t blk_sz_r, blk_sz_c;  // Br, Bc
@@ -464,7 +464,7 @@ void simple_flash_attn_f16_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_li
                 HVX_Vector v_mask0 = vmemu(qk_mask + q_idx0 * kv_pad_len + k_idx);
                 HVX_Vector v_mask1 = vmemu(qk_mask + q_idx1 * kv_pad_len + k_idx);
 
-                const HVX_Vector v_fp16_mask_threshold = Q6_Vh_vsplat_R(0xcc00);  // fp16: -16.0
+                const HVX_Vector v_fp16_mask_threshold = Q6_Vh_vsplat_R(0xd800);  // fp16: -128.0
 
                 q_mask_keep0 = Q6_Q_vcmp_gt_VhfVhf(v_mask0, v_fp16_mask_threshold);
                 q_mask_keep1 = Q6_Q_vcmp_gt_VhfVhf(v_mask1, v_fp16_mask_threshold);
