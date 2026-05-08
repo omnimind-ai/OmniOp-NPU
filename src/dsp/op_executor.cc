@@ -202,6 +202,25 @@ int execute_op_simple(struct OpComputeRequest *req) {
       }
       break;
 
+    case HTP_OPS_MUL_F32:
+      {
+        auto params = reinterpret_cast<MulF32Params *>(req->payload);
+
+        size_t dst_size  = params->ne0 * params->ne1 * sizeof(float);
+        size_t src0_size = dst_size;
+        size_t src1_size = (params->src1_broadcast ? params->ne0 : params->ne0 * params->ne1) * sizeof(float);
+
+        add_buffer(out_bufs, params->dst, dst_size);
+        add_buffer(in_bufs, params->src0, src0_size);
+        add_buffer(in_bufs, params->src1, src1_size);
+
+        validate_in_bufs();
+        ret = hvx_mul_f32((float *) OUT_PTR(0), (const float *) IN_PTR(0), (const float *) IN_PTR(1),
+                          params->ne0, params->ne1, params->src1_broadcast);
+        validate_out_bufs();
+      }
+      break;
+
     default:
       break;
   }

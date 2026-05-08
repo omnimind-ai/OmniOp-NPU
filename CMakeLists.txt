@@ -76,6 +76,7 @@ else()
         ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/ops/flash_attn_sp_hdim.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/ops/flash_attn.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/ops/mat_mul.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/ops/elementwise.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/ops/precompute_table.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/ops/rms_norm.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/ops/mm_benchmark.c
