@@ -251,7 +251,10 @@ AEEResult htp_ops_init_backend(remote_handle64 handle) {
 // FastRPC interface
 AEEResult htp_ops_create_channel(remote_handle64 handle, int32 fd, uint32 size) {
   if (message_channel_is_active(&global_msg_chan)) {
-    return AEE_EALREADY;
+    int err = message_channel_destroy(&global_msg_chan);
+    if (err) {
+      return err;
+    }
   }
 
   return message_channel_create(&global_msg_chan, fd, size);

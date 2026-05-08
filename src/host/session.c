@@ -94,3 +94,7 @@ void init_htp_backend() {
 int create_htp_message_channel(int fd, unsigned int max_msg_size) {
   return htp_ops_create_channel(session_handle, fd, max_msg_size);
 }
+
+int destroy_htp_message_channel() {
+  return htp_ops_destroy_channel(session_handle);
+}
