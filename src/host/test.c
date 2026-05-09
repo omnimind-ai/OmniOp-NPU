@@ -57,9 +57,7 @@ void free_shared_mem_buf(void *buf, int fd, size_t size) {
   rpcmem_free(buf);
 }
 
-static void rms_norm_f32_ref(float *dst, const float *src, int ne0, int ne1) {
-  const float eps = 1e-5;
-
+static void rms_norm_f32_ref(float *dst, const float *src, int ne0, int ne1, float eps) {
   for (int j = 0; j < ne1; ++j) {
     const float *x = src + j * ne0;
     float       *y = dst + j * ne0;
@@ -79,11 +77,19 @@ static void rms_norm_f32_ref(float *dst, const float *src, int ne0, int ne1) {
   }
 }
 
+static void fill_rms_norm_sensitive_input(float *src, int ne0) {
+  for (int i = 0; i < ne0; ++i) {
+    int centered = (i % 17) - 8;
+    src[i] = centered * 1e-5f;
+  }
+}
+
 static void test_rms_norm_f32_rpc(remote_handle64 handle, int ne0) {
   float *src, *dsp_dst, *ref_dst;
   int    fd_src, fd_dst;
 
   int err, passed = 0;
+  const float eps = 1e-6f;
 
   src = dsp_dst = ref_dst = NULL;
   size_t size             = align_up(ne0 * sizeof(float), 128);
@@ -96,13 +102,10 @@ static void test_rms_norm_f32_rpc(remote_handle64 handle, int ne0) {
   }
   ref_dst = (float *) malloc(size);
 
-  // fill data, [0, 20000] -> [-20, 20]
-  for (int i = 0; i < ne0; ++i) {
-    src[i] = (rand() % 20000) * 2e-3f - 20.0f;
-  }
+  fill_rms_norm_sensitive_input(src, ne0);
 
   int64_t t0             = get_time_us();
-  err                    = htp_ops_rms_norm_f32(handle, fd_dst, 0, fd_src, 0, ne0, 1);
+  err                    = htp_ops_rms_norm_f32(handle, fd_dst, 0, fd_src, 0, ne0, 1, eps);
   int64_t rpc_elapsed_us = get_time_us() - t0;
   fprintf(stderr, "rms_norm_f32 RPC took %ld us\n", rpc_elapsed_us);
 
@@ -110,7 +113,7 @@ static void test_rms_norm_f32_rpc(remote_handle64 handle, int ne0) {
     fprintf(stderr, "%s: RPC failed with %x\n", __func__, err);
     goto end;
   }
-  rms_norm_f32_ref(ref_dst, src, ne0, 1);
+  rms_norm_f32_ref(ref_dst, src, ne0, 1, eps);
 
   int   n_failed = 0;
   float tol      = 1e-5;
@@ -146,6 +149,7 @@ static void test_rms_norm_f32_chan(void *chan, int ne0) {
   int    fd_src, fd_dst;
 
   int err, passed = 0;
+  const float eps = 1e-6f;
 
   src = dsp_dst = ref_dst = NULL;
   size_t size             = align_up(ne0 * sizeof(float), 128);
@@ -158,10 +162,7 @@ static void test_rms_norm_f32_chan(void *chan, int ne0) {
   }
   ref_dst = (float *) malloc(size);
 
-  // fill data, [0, 20000] -> [-20, 20]
-  for (int i = 0; i < ne0; ++i) {
-    src[i] = (rand() % 20000) * 2e-3f - 20.0f;
-  }
+  fill_rms_norm_sensitive_input(src, ne0);
 
   {
     struct RequestHeader req_hdr = {
@@ -176,6 +177,7 @@ static void test_rms_norm_f32_chan(void *chan, int ne0) {
       .src = { .fd = fd_src, .offset = 0, },
       .ne0 = ne0,
       .ne1 = 1,
+      .eps = eps,
     };
 
     size_t req_size     = sizeof(req_hdr) + sizeof(compute_req) + sizeof(params);
@@ -206,7 +208,7 @@ static void test_rms_norm_f32_chan(void *chan, int ne0) {
     fprintf(stderr, "%s: CHAN failed with %x\n", __func__, err);
     goto end;
   }
-  rms_norm_f32_ref(ref_dst, src, ne0, 1);
+  rms_norm_f32_ref(ref_dst, src, ne0, 1, eps);
 
   int   n_failed = 0;
   float tol      = 1e-5;
@@ -498,36 +500,38 @@ int main(int argc, char **argv) {
     return 0;
   }
 
+  if (getenv("HTP_TEST_RMS_NORM")) {
+    test_rms_norm_f32_rpc(get_global_handle(), 60000);
+
+    void        *chan;
+    int          chan_fd;
+    const size_t max_msg_size = 4096;
+
+    err = alloc_shared_mem_buf(&chan, &chan_fd, max_msg_size);
+    if (err) {
+      fprintf(stderr, "Cannot allocate rpcmem for message channel\n");
+      close_dsp_session();
+      return 1;
+    }
+
+    err = htp_ops_create_channel(get_global_handle(), chan_fd, max_msg_size);
+    if (err) {
+      fprintf(stderr, "Create channel failed\n");
+      free_shared_mem_buf(chan, chan_fd, max_msg_size);
+      close_dsp_session();
+      return 1;
+    }
+
+    test_rms_norm_f32_chan(chan, 60000);
+
+    htp_ops_destroy_channel(get_global_handle());
+    free_shared_mem_buf(chan, chan_fd, max_msg_size);
+    close_dsp_session();
+    return 0;
+  }
+
   htp_ops_test_ops(get_global_handle());
 
-  /*
-  test_rms_norm_f32_rpc(get_global_handle(), 60000);
-
-  void        *chan;
-  int          chan_fd;
-  const size_t max_msg_size = 4096;
-
-  err = alloc_shared_mem_buf(&chan, &chan_fd, max_msg_size);
-  if (err) {
-    fprintf(stderr, "Cannot allocate rpcmem for message channel\n");
-    goto skip1;
-  }
-
-  err = htp_ops_create_channel(get_global_handle(), chan_fd, max_msg_size);
-  if (err) {
-    fprintf(stderr, "Create channel failed\n");
-    goto skip2;
-  }
-
-  test_rms_norm_f32_chan(chan, 60000);
-
-  htp_ops_destroy_channel(get_global_handle());
-
-skip2:
-  free_shared_mem_buf(chan, chan_fd, max_msg_size);
-  */
-
-skip1:
   close_dsp_session();
   return 0;
 }
