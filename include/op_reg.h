@@ -34,6 +34,13 @@ struct MatMulParams {
   int32_t m;
   int32_t k;
   int32_t n;
+  int32_t skip_scale;
+} __attribute__((packed));
+
+struct BenchmarkInt8Params {
+  struct RpcmemBufAddr result_buf;
+  int32_t K;
+  int32_t n_iters;
 } __attribute__((packed));
 
 struct FlashAttnParams {
