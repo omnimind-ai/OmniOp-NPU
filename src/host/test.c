@@ -272,29 +272,39 @@ end:
   fprintf(stderr, passed ? "%s passed\n" : "%s failed\n", __func__);
 }
 
-static void test_mat_mul_rpc(remote_handle64 handle) {
-  float *activation, *output;
-  __fp16 *weight;
+static int test_mat_mul_chan_shape(void *chan, int m, int k, int n) {
+  struct MessageHeader *msg = (struct MessageHeader *) chan;
 
-  int output_fd, activation_fd, weight_fd;
+  float *activation = NULL, *output = NULL;
+  __fp16 *weight = NULL;
+  float *weight_ref = NULL, *output_ref = NULL, *output_mix = NULL;
+  __fp16 *output_f16 = NULL;
 
-  int m = 1;
-  int k = 1024;
-  // int n = 608; // 576 | 608
-  int n = 1024;
+  int output_fd = -1, activation_fd = -1, weight_fd = -1;
 
-  alloc_shared_mem_buf((void **) &output, &output_fd, m * n * sizeof(float));
-  alloc_shared_mem_buf((void **) &activation, &activation_fd, m * k * sizeof(float));
-  alloc_shared_mem_buf((void **) &weight, &weight_fd, k * n * sizeof(__fp16));
+  int passed = 0;
 
-  float *weight_ref = (float *) malloc(n * k * sizeof(float));
-  float *output_ref = (float *) malloc(m * n * sizeof(float));
+  if (alloc_shared_mem_buf((void **) &output, &output_fd, m * n * sizeof(float))) {
+    goto end;
+  }
+  if (alloc_shared_mem_buf((void **) &activation, &activation_fd, m * k * sizeof(float))) {
+    goto end;
+  }
+  if (alloc_shared_mem_buf((void **) &weight, &weight_fd, k * n * sizeof(__fp16))) {
+    goto end;
+  }
+
+  weight_ref = (float *) malloc(n * k * sizeof(float));
+  output_ref = (float *) malloc(m * n * sizeof(float));
+  output_f16 = (__fp16 *) malloc(m * n * sizeof(__fp16));
+  output_mix = (float *) malloc(m * n * sizeof(float));
+  if (!weight_ref || !output_ref || !output_f16 || !output_mix) {
+    fprintf(stderr, "%s: host malloc failed for m=%d k=%d n=%d\n", __func__, m, k, n);
+    goto end;
+  }
+
   memset(output_ref, 0, m * n * sizeof(float));
-
-  __fp16 *output_f16 = (__fp16 *) malloc(m * n * sizeof(__fp16));
   memset(output_f16, 0, m * n * sizeof(__fp16));
-
-  float *output_mix = (float *) malloc(m * n * sizeof(float));
   memset(output_mix, 0, m * n * sizeof(float));
 
   for (int i = 0; i < m; ++i)
@@ -314,7 +324,72 @@ static void test_mat_mul_rpc(remote_handle64 handle) {
     }
   }
 
-  htp_ops_mat_mul_permuted_w16a32(handle, output_fd, 0, activation_fd, 0, weight_fd, 0, m, k, n);
+  struct RequestHeader req_hdr = {
+    .state = 0,
+    .type  = REQUEST_TYPE_OP_COMPUTE,
+  };
+  struct OpComputeRequest compute_req = {
+    .op = HTP_OPS_MAT_MUL_PERMUTED_W16A32,
+  };
+  struct MatMulParams params = {
+    .output     = { .fd = output_fd,     .offset = 0, },
+    .activation = { .fd = activation_fd, .offset = 0, },
+    .weight     = { .fd = weight_fd,     .offset = 0, },
+    .m          = m,
+    .k          = k,
+    .n          = n,
+    .skip_scale = 0,
+  };
+
+  struct RequestHeader map_req_hdr = {
+    .state = 0,
+    .type  = REQUEST_TYPE_RPCMEM_MAP,
+  };
+  struct RpcmemMapRequest map_req = {
+    .n_puts = 3,
+    .n_gets = 0,
+  };
+
+  size_t op_req_size  = sizeof(req_hdr) + sizeof(compute_req) + sizeof(params);
+  size_t map_req_size = sizeof(map_req_hdr) + sizeof(map_req) + 3 * sizeof(int32_t);
+  msg->state.d        = 0;
+  msg->n_reqs         = 2;
+  msg->req_offsets[0] = message_header_size(msg);
+  msg->req_offsets[1] = msg->req_offsets[0] + op_req_size;
+  msg->req_offsets[2] = msg->req_offsets[1] + map_req_size;
+
+  uint8_t *p                  = (uint8_t *) message_header_get_request_ptr(msg, 0);
+  *(struct RequestHeader *) p = req_hdr;
+  p += sizeof(struct RequestHeader);
+  *(struct OpComputeRequest *) p = compute_req;
+  p += sizeof(struct OpComputeRequest);
+  *(struct MatMulParams *) p = params;
+
+  p = (uint8_t *) message_header_get_request_ptr(msg, 1);
+  *(struct RequestHeader *) p = map_req_hdr;
+  p += sizeof(struct RequestHeader);
+  *(struct RpcmemMapRequest *) p = map_req;
+  p += sizeof(struct RpcmemMapRequest);
+  *(int32_t *) p = output_fd;
+  p += sizeof(int32_t);
+  *(int32_t *) p = activation_fd;
+  p += sizeof(int32_t);
+  *(int32_t *) p = weight_fd;
+
+  __sync_synchronize();
+  int64_t t0      = get_time_us();
+  msg->state.v[0] = 1;
+  while (msg->state.v[1] != 1) {
+    usleep(1);
+  }
+  int64_t elapsed_us = get_time_us() - t0;
+
+  int err = message_header_get_request_ptr(msg, 0)->state;
+  msg->state.d = 0;
+  if (err != 0) {
+    fprintf(stderr, "%s: channel op failed with %x for m=%d k=%d n=%d\n", __func__, err, m, k, n);
+    goto end;
+  }
 
   for (int i = 0; i < m; ++i) {
     for (int j = 0; j < n; ++j) {
@@ -326,17 +401,64 @@ static void test_mat_mul_rpc(remote_handle64 handle) {
     }
   }
 
-  for (int i = 0; i < m * n; ++i)
-    printf("#%d hmx: %g, f32: %g, f16: %g, mix: %g\n", i, output[i], output_ref[i], output_f16[i], output_mix[i]);
+  int   n_failed = 0;
+  float max_abs  = 0.0f;
+  for (int i = 0; i < m * n; ++i) {
+    float diff = fabsf(output[i] - output_mix[i]);
+    if (diff > max_abs) {
+      max_abs = diff;
+    }
+    if (diff > 2.0f) {
+      if (n_failed < 16) {
+        fprintf(stderr, "#%d hmx=%g mix=%g f32=%g diff=%g\n", i, output[i], output_mix[i], output_ref[i], diff);
+      }
+      n_failed++;
+    }
+  }
+  passed = (n_failed == 0);
+  fprintf(stderr, "mat_mul_w16a32_chan m=%d k=%d n=%d elapsed_us=%ld max_abs=%g failed=%d %s\n",
+          m, k, n, elapsed_us, max_abs, n_failed,
+          passed ? "passed" : "failed");
 
-  free(weight_ref);
-  free(output_ref);
-  free(output_f16);
-  free(output_mix);
+end:
+  if (weight_ref) {
+    free(weight_ref);
+  }
+  if (output_ref) {
+    free(output_ref);
+  }
+  if (output_f16) {
+    free(output_f16);
+  }
+  if (output_mix) {
+    free(output_mix);
+  }
 
-  free_shared_mem_buf(output, output_fd, m * n * sizeof(float));
-  free_shared_mem_buf(activation, activation_fd, m * k * sizeof(float));
-  free_shared_mem_buf(weight, weight_fd, k * n * sizeof(__fp16));
+  if (output) {
+    free_shared_mem_buf(output, output_fd, m * n * sizeof(float));
+  }
+  if (activation) {
+    free_shared_mem_buf(activation, activation_fd, m * k * sizeof(float));
+  }
+  if (weight) {
+    free_shared_mem_buf(weight, weight_fd, k * n * sizeof(__fp16));
+  }
+
+  return passed ? 0 : 1;
+}
+
+static void test_mat_mul_chan(void *chan) {
+  int failed = 0;
+
+  failed += test_mat_mul_chan_shape(chan, 1, 1024, 1024);
+  failed += test_mat_mul_chan_shape(chan, 1, 1536, 1024);
+  failed += test_mat_mul_chan_shape(chan, 64, 1536, 1024);
+  failed += test_mat_mul_chan_shape(chan, 1, 1536, 256);
+  failed += test_mat_mul_chan_shape(chan, 64, 1536, 256);
+  failed += test_mat_mul_chan_shape(chan, 1, 256, 1536);
+  failed += test_mat_mul_chan_shape(chan, 64, 256, 1536);
+
+  fprintf(stderr, failed == 0 ? "%s passed\n" : "%s failed: %d shapes failed\n", __func__, failed);
 }
 
 int main(int argc, char **argv) {
@@ -348,7 +470,33 @@ int main(int argc, char **argv) {
 
   init_htp_backend();
 
-  // test_mat_mul_rpc(get_global_handle());
+  if (getenv("HTP_TEST_MATMUL")) {
+    void        *chan;
+    int          chan_fd;
+    const size_t max_msg_size = 4096;
+
+    err = alloc_shared_mem_buf(&chan, &chan_fd, max_msg_size);
+    if (err) {
+      fprintf(stderr, "Cannot allocate rpcmem for message channel\n");
+      close_dsp_session();
+      return 1;
+    }
+
+    err = htp_ops_create_channel(get_global_handle(), chan_fd, max_msg_size);
+    if (err) {
+      fprintf(stderr, "Create channel failed\n");
+      free_shared_mem_buf(chan, chan_fd, max_msg_size);
+      close_dsp_session();
+      return 1;
+    }
+
+    test_mat_mul_chan(chan);
+
+    htp_ops_destroy_channel(get_global_handle());
+    free_shared_mem_buf(chan, chan_fd, max_msg_size);
+    close_dsp_session();
+    return 0;
+  }
 
   htp_ops_test_ops(get_global_handle());
 
