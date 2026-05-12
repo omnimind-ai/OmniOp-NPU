@@ -193,10 +193,9 @@ int execute_op_simple(struct OpComputeRequest *req) {
           free(ref_out);
         } else {
           validate_in_bufs();
-          ret =
-            simple_flash_attn((__fp16 *) OUT_PTR(0), (__fp16 *) IN_PTR(0), (__fp16 *) IN_PTR(1), (__fp16 *) IN_PTR(2),
-                              (__fp16 *) IN_PTR(3), qo_len, kv_len, n_heads, n_kv_heads, head_dim, scale,
-                              mask_stride);
+          ret = simple_flash_attn_qo_f32_kv_f16((float *) OUT_PTR(0), (float *) IN_PTR(0), (__fp16 *) IN_PTR(1),
+                                                (__fp16 *) IN_PTR(2), (__fp16 *) IN_PTR(3), qo_len, kv_len, n_heads,
+                                                n_kv_heads, head_dim, scale, mask_stride);
           validate_out_bufs();
         }
       }

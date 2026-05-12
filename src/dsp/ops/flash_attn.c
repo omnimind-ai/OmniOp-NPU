@@ -27,8 +27,9 @@ typedef struct {
   uint8_t           *vtcm_base;
   size_t             vtcm_size_per_thread;
   // params
-  __fp16            *O;
-  const __fp16      *Q, *K, *V, *mask;
+  void              *O;
+  const void        *Q;
+  const __fp16      *K, *V, *mask;
   int                qo_len, kv_len, n_heads, n_kv_heads, head_dim;
   int                mask_stride;
   float              scale;
@@ -865,8 +866,8 @@ void fa_f32_find_chunk_size(size_t *blk_r, size_t *blk_c, int group_size, int he
                          fa_f32_compute_vtcm_usage);
 }
 
-void simple_flash_attn_f32_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_limit, __fp16 *restrict O,
-                                const __fp16 *restrict Q, const __fp16 *restrict K, const __fp16 *restrict V,
+void simple_flash_attn_f32_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_limit, float *restrict O,
+                                const float *restrict Q, const __fp16 *restrict K, const __fp16 *restrict V,
                                 const __fp16 *restrict qk_mask, int qo_len, int kv_len, int n_heads, int n_kv_heads,
                                 int head_dim, float scale, int mask_stride, int q_head_start, int q_head_count) {
   const int G = q_head_count;  // query heads handled by this task
@@ -1327,11 +1328,11 @@ void simple_flash_attn_worker(void *data, int worker_index) {
       const int q_head_idx = task_id * q_head_group;
       const int q_head_count = smin(q_head_group, s->n_heads - q_head_idx);
       kv_head_idx = q_head_idx / gqa_factor;
-      simple_flash_attn_f32_core(kv_head_idx, vtcm, vtcm_limit, s->O, s->Q, s->K, s->V, s->mask, s->qo_len,
+      simple_flash_attn_f32_core(kv_head_idx, vtcm, vtcm_limit, (float *) s->O, (const float *) s->Q, s->K, s->V, s->mask, s->qo_len,
                                  s->kv_len, s->n_heads, s->n_kv_heads, s->head_dim, s->scale, s->mask_stride,
                                  q_head_idx, q_head_count);
     } else {
-      simple_flash_attn_f16_core(kv_head_idx, vtcm, vtcm_limit, s->O, s->Q, s->K, s->V, s->mask, s->qo_len,
+      simple_flash_attn_f16_core(kv_head_idx, vtcm, vtcm_limit, (__fp16 *) s->O, (const __fp16 *) s->Q, s->K, s->V, s->mask, s->qo_len,
                                  s->kv_len, s->n_heads, s->n_kv_heads, s->head_dim, s->scale, s->mask_stride,
                                  worker_index);
     }
@@ -1354,9 +1355,75 @@ int simple_flash_attn_sp_hdim(__fp16 *restrict O, const __fp16 *restrict Q, cons
  * Q: [qo_len, n_heads, head_dim], K/V: [kv_len, n_kv_heads, head_dim]
  * mask: [qo_len*, kv_len] broadcast to each head (first dimension maybe larger than qo_len)
  */
+int simple_flash_attn_qo_f32_kv_f16(float *restrict O, const float *restrict Q, const __fp16 *restrict K,
+                                    const __fp16 *restrict V, const __fp16 *restrict mask, int qo_len, int kv_len,
+                                    int n_heads, int n_kv_heads, int head_dim, float scale, int mask_stride) {
+  if (mask == NULL) {
+    FARF(ALWAYS, "FA qo_f32_kv_f16 not supported without mask yet: qo_len=%d kv_len=%d n_heads=%d n_kv_heads=%d head_dim=%d",
+         qo_len, kv_len, n_heads, n_kv_heads, head_dim);
+    return -1;
+  }
+  if (head_dim % 64 != 0) {
+    FARF(ALWAYS, "FA qo_f32_kv_f16 not supported for non-64 head_dim yet: head_dim=%d", head_dim);
+    return -1;
+  }
+  if (n_heads % n_kv_heads != 0) {
+    FARF(ALWAYS, "FA qo_f32_kv_f16 not supported: n_heads=%d n_kv_heads=%d", n_heads, n_kv_heads);
+    return -1;
+  }
+
+  const int    n_workers            = num_hvx128_contexts;
+  const size_t vtcm_size_per_thread = 1024 * 1024;
+  assert(n_workers * vtcm_size_per_thread <= 6 * 1024 * 1024);
+
+  simple_fa_task_state_t state;
+  state.O          = O;
+  state.Q          = Q;
+  state.K          = K;
+  state.V          = V;
+  state.mask       = mask;
+  state.qo_len     = qo_len;
+  state.kv_len     = kv_len;
+  state.n_heads    = n_heads;
+  state.n_kv_heads = n_kv_heads;
+  state.head_dim   = head_dim;
+  state.mask_stride = mask_stride;
+  state.scale      = scale;
+
+  state.task_id              = 0;
+  const int gqa_factor       = n_heads / n_kv_heads;
+  const int q_head_group     = smin(gqa_factor, FA_F32_Q_HEAD_GROUP);
+  state.n_tasks              = head_dim >= 256 && FA_USE_F32_FOR_HEAD_DIM(head_dim) ? ceil_div(n_heads, q_head_group) : n_kv_heads;
+  state.vtcm_base            = (uint8_t *) vtcm_manager_get_vtcm_base();
+  state.vtcm_size_per_thread = vtcm_size_per_thread;
+
+  worker_pool_job_t job;
+  job.fptr = simple_flash_attn_worker;
+  job.dptr = &state;
+
+  int64_t t0 = HAP_perf_get_time_us();
+
+  worker_pool_synctoken_init(&(state.sync_ctx), n_workers);
+  for (int i = 0; i < n_workers; ++i) {
+    worker_pool_submit(NULL, job);
+  }
+  worker_pool_synctoken_wait(&(state.sync_ctx));
+
+  int64_t elapsed_us = HAP_perf_get_time_us() - t0;
+  FARF(ALWAYS, "%s: %lld us, qo_len=%d kv_len=%d n_heads=%d n_kv_heads=%d head_dim=%d", __func__, elapsed_us, qo_len,
+       kv_len, n_heads, n_kv_heads, head_dim);
+
+  return 0;
+}
+
 int simple_flash_attn(__fp16 *restrict O, const __fp16 *restrict Q, const __fp16 *restrict K, const __fp16 *restrict V,
                       const __fp16 *restrict mask, int qo_len, int kv_len, int n_heads, int n_kv_heads, int head_dim,
                       float scale, int mask_stride) {
+  if (mask == NULL) {
+    FARF(ALWAYS, "FA not supported without mask yet: qo_len=%d kv_len=%d n_heads=%d n_kv_heads=%d head_dim=%d",
+         qo_len, kv_len, n_heads, n_kv_heads, head_dim);
+    return -1;
+  }
   if (head_dim % 64 != 0) {
     return simple_flash_attn_sp_hdim(O, Q, K, V, mask, qo_len, kv_len, n_heads, n_kv_heads, head_dim, scale,
                                      mask_stride);
