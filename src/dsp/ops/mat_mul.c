@@ -1309,7 +1309,6 @@ int mat_mul_qk_0_d16a32_out_stationary(float *restrict out, const float *restric
   __fp16  *vtcm_activation = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, ACTIVATION_AREA_SIZE);
   __fp16  *vtcm_output     = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, OUTPUT_AREA_SIZE);
   uint8_t *vtcm_scratch0   = vtcm_seq_alloc(&vtcm_ptr, SCRATCH_AREA_SIZE);
-  uint8_t *vtcm_scratch1   = vtcm_seq_alloc(&vtcm_ptr, SCRATCH_AREA_SIZE * 2);
   __fp16  *vtcm_eye_tile   = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, HMX_FP16_TILE_SIZE);
   __fp16  *vtcm_scales     = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, 256);
 
@@ -1357,33 +1356,9 @@ int mat_mul_qk_0_d16a32_out_stationary(float *restrict out, const float *restric
         size_t k_blk_sz = smin(k - kk, K_BLOCK_SIZE);
 
         int64_t t0 = HAP_perf_get_qtimer_count();
-        // fetch activation block into VTCN
-        {
-          const float *activation_block = x + mr * k + kk;
-
-          _Alignas(64) dma_desc_2d_t desc = { 0 };
-
-          desc.next       = 0;
-          desc.length     = 0;
-          desc.type       = DMA_DESC_TYPE_2D;
-          desc.src_bypass = 1;
-          desc.dst_bypass = 0;
-          desc.ordered    = 1;
-          desc.dstate     = DMA_DESC_DSTATE_PENDING;
-
-          desc.src              = (uint32_t) activation_block;
-          desc.dst              = (uint32_t) vtcm_scratch1;
-          desc.roi_width        = k_blk_sz * sizeof(float);
-          desc.roi_height       = m_blk_sz;
-          desc.src_stride       = k * sizeof(float);
-          desc.dst_stride       = k_blk_sz * sizeof(float);
-          desc.src_width_offset = 0;
-          desc.dst_width_offset = 0;
-
-          dma_wait_for_idle();
-          dma_submit_one((dma_desc_1d_t *) &desc);
-          dma_wait_for_idle();
-        }
+        const float *activation_block = x + mr * k + kk;
+        // fetch activation block directly through the proven common conversion path.
+        // The previous 2D DMA staging path produced wrong results for m >= 128.
 
         // fetch weight block into VTCM
         {
@@ -1408,13 +1383,7 @@ int mat_mul_qk_0_d16a32_out_stationary(float *restrict out, const float *restric
         int64_t t1 = HAP_perf_get_qtimer_count();
         // load activation block
         {
-          // const float *activation_block = x + mr * k + kk;
-          // transfer_activation_chunk_fp32_to_fp16(vtcm_activation, activation_block, m_blk_sz, k_blk_sz, k);
-          // transfer_activation_chunk_multithread(vtcm_activation, activation_block, m_blk_sz, k_blk_sz, k);
-
-          // NOTE(hzx): This code assumes that the activation block already resides in VTCM
-          // transfer_activation_chunk_no_prefetch(vtcm_activation, (float *) vtcm_scratch1, m_blk_sz, k_blk_sz, k_blk_sz);
-          transfer_activation_chunk_multithread(vtcm_activation, (float *) vtcm_scratch1, m_blk_sz, k_blk_sz, k_blk_sz);
+          transfer_activation_chunk_fp32_to_fp16(vtcm_activation, activation_block, m_blk_sz, k_blk_sz, k);
         }
 
         // dequantize weight block
