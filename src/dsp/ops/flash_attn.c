@@ -163,8 +163,12 @@ void simple_flash_attn_f16_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_li
   const bool   has_qk_mask = true;
   const size_t kv_pad_len  = qk_mask ? mask_stride : align_up(kv_len, 64);
 
-  const bool enable_vgather_exp = head_dim != 256;  // use table lookup (vgather) to compute exp, experimental
-  const bool use_fp32_exp       = head_dim == 256;  // compute FP32 exp
+  // Keep exp mode explicit while Qwen3 FA correctness is being debugged.
+  // The vgather table path is fast but experimental and has produced wrong
+  // model-level output on Qwen3. Re-enable it only after standalone and
+  // end-to-end correctness gates pass.
+  const bool enable_vgather_exp = false;
+  const bool use_fp32_exp       = true;
 
   // determine block sizes
   size_t blk_sz_r, blk_sz_c;  // Br, Bc
