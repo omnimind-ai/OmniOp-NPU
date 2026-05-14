@@ -13,6 +13,7 @@
 #include "htp_ops.h"  // auto-generated
 #include "message.h"
 #include "op_reg.h"
+#include "dsp/quants.h"
 
 static inline int64_t get_time_us() {
   struct timespec ts;
@@ -30,6 +31,55 @@ static inline double rand_01() {
 
 static inline float rand_centered(float scale) {
   return (float) ((rand_01() * 2.0 - 1.0) * scale);
+}
+
+static inline size_t hmx_permuted_index(int row_k, int col_n, int k) {
+  const int i0 = row_k / 32;
+  const int i1 = row_k % 32;
+  const int j0 = col_n / 32;
+  const int j1 = col_n % 32;
+  const int tile_idx = j0 * (k / 32) + i0;
+  return (size_t) tile_idx * 1024 + (size_t) (i1 & ~1) * 32 + (size_t) j1 * 2 + (i1 & 1);
+}
+
+static void quantize_permuted_q4_0(const float *src, my_block_q4_0 *dst, float *deq, int n_elements) {
+  const int n_blocks = n_elements / QK4_0;
+  const int n_super  = n_blocks / 8;
+
+  for (int s = 0; s < n_super; ++s) {
+    uint8_t quants_unpacked[8 * QK4_0];
+
+    for (int g = 0; g < 8; ++g) {
+      const int base = (s * 8 + g) * QK4_0;
+      float amax = 0.0f;
+      for (int i = 0; i < QK4_0; ++i) {
+        const float v = src[base + i];
+        if (fabsf(v) > amax) {
+          amax = fabsf(v);
+        }
+      }
+
+      const float d = amax > 0.0f ? amax / 7.0f : 0.0f;
+      const float id = d > 0.0f ? 1.0f / d : 0.0f;
+      dst[s].scales[g] = (__fp16) d;
+
+      for (int i = 0; i < QK4_0; ++i) {
+        int q = (int) roundf(src[base + i] * id) + 8;
+        if (q < 0) {
+          q = 0;
+        } else if (q > 15) {
+          q = 15;
+        }
+        quants_unpacked[g * QK4_0 + i] = (uint8_t) q;
+        deq[base + i] = (float) ((__fp16) ((q - 8) * (float) dst[s].scales[g]));
+      }
+    }
+
+    for (int i = 0; i < 64; ++i) {
+      dst[s].quants[i * 2 + 0] = (uint8_t) ((quants_unpacked[i + 128] << 4) | quants_unpacked[i + 0]);
+      dst[s].quants[i * 2 + 1] = (uint8_t) ((quants_unpacked[i + 192] << 4) | quants_unpacked[i + 64]);
+    }
+  }
 }
 
 // assert p_buf, p_fd and size are always valid
@@ -564,10 +614,14 @@ static int test_flash_attn_chan_shape(void *chan, int qo_len, int kv_len, int n_
     k[i] = (__fp16) rand_centered(0.2f);
     v[i] = (__fp16) rand_centered(0.2f);
   }
+  const int causal_mask = getenv("HTP_TEST_FA_CAUSAL") ? atoi(getenv("HTP_TEST_FA_CAUSAL")) : 0;
   if (use_mask) {
+    const int causal_base = kv_len > qo_len ? kv_len - qo_len : 0;
     for (int r = 0; r < qo_len; ++r) {
       for (int c = 0; c < mask_stride; ++c) {
-        mask[r * mask_stride + c] = c < kv_len ? (__fp16) 0.0f : (__fp16) -INFINITY;
+        const int in_kv = c < kv_len;
+        const int allowed = !causal_mask || c <= causal_base + r;
+        mask[r * mask_stride + c] = (in_kv && allowed) ? (__fp16) 0.0f : (__fp16) -INFINITY;
       }
     }
   }
@@ -698,7 +752,7 @@ end:
   return passed ? 0 : 1;
 }
 
-static void test_flash_attn_chan(void *chan) {
+static int test_flash_attn_chan(void *chan) {
   int failed = 0;
 
   const char *qo_env = getenv("HTP_TEST_FA_QO");
@@ -712,7 +766,7 @@ static void test_flash_attn_chan(void *chan) {
     const int use_mask = getenv("HTP_TEST_FA_MASK") ? atoi(getenv("HTP_TEST_FA_MASK")) : 1;
     failed += test_flash_attn_chan_shape(chan, qo_len, kv_len, n_heads, n_kv_heads, head_dim, use_mask);
     fprintf(stderr, failed == 0 ? "%s passed\n" : "%s failed: %d shapes failed\n", __func__, failed);
-    return;
+    return failed;
   }
 
   failed += test_flash_attn_chan_shape(chan, 1, 64, 16, 4, 256, 1);
@@ -721,6 +775,187 @@ static void test_flash_attn_chan(void *chan) {
   failed += test_flash_attn_chan_shape(chan, 8, 128, 16, 4, 256, 0);
 
   fprintf(stderr, failed == 0 ? "%s passed\n" : "%s failed: %d shapes failed\n", __func__, failed);
+  return failed;
+}
+
+static int test_quant_mat_mul_chan_shape(void *chan, int m, int k, int n) {
+  struct MessageHeader *msg = (struct MessageHeader *) chan;
+
+  float *activation = NULL, *output = NULL, *weight_perm = NULL, *weight_deq_perm = NULL, *output_ref = NULL;
+  my_block_q4_0 *weight_q4 = NULL;
+  int output_fd = -1, activation_fd = -1, weight_fd = -1;
+  int passed = 0;
+
+  if (k % 256 != 0 || n % 32 != 0) {
+    fprintf(stderr, "%s: k must be multiple of 256 and n multiple of 32, got m=%d k=%d n=%d\n", __func__, m, k, n);
+    goto end;
+  }
+
+  const size_t output_size = (size_t) m * n * sizeof(float);
+  const size_t activation_size = (size_t) m * k * sizeof(float);
+  const size_t permuted_weight_elems = (size_t) n * k;
+  const size_t weight_size = permuted_weight_elems / QK_K * sizeof(my_block_q4_0);
+
+  if (alloc_shared_mem_buf((void **) &output, &output_fd, output_size)) goto end;
+  if (alloc_shared_mem_buf((void **) &activation, &activation_fd, activation_size)) goto end;
+  if (alloc_shared_mem_buf((void **) &weight_q4, &weight_fd, weight_size)) goto end;
+
+  weight_perm = (float *) malloc(permuted_weight_elems * sizeof(float));
+  weight_deq_perm = (float *) malloc(permuted_weight_elems * sizeof(float));
+  output_ref = (float *) calloc((size_t) m * n, sizeof(float));
+  if (!weight_perm || !weight_deq_perm || !output_ref) {
+    fprintf(stderr, "%s: host malloc failed for m=%d k=%d n=%d\n", __func__, m, k, n);
+    goto end;
+  }
+
+  memset(output, 0, output_size);
+  for (int i = 0; i < m * k; ++i) {
+    activation[i] = rand_centered(0.25f);
+  }
+  for (int col = 0; col < n; ++col) {
+    for (int row = 0; row < k; ++row) {
+      const float v = rand_centered(0.2f);
+      weight_perm[hmx_permuted_index(row, col, k)] = v;
+    }
+  }
+
+  quantize_permuted_q4_0(weight_perm, weight_q4, weight_deq_perm, (int) permuted_weight_elems);
+
+  for (int row_m = 0; row_m < m; ++row_m) {
+    for (int col = 0; col < n; ++col) {
+      float acc = 0.0f;
+      for (int row_k = 0; row_k < k; ++row_k) {
+        acc += activation[row_m * k + row_k] * weight_deq_perm[hmx_permuted_index(row_k, col, k)];
+      }
+      output_ref[row_m * n + col] = acc;
+    }
+  }
+
+  struct RequestHeader req_hdr = {
+    .state = 0,
+    .type  = REQUEST_TYPE_OP_COMPUTE,
+  };
+  struct OpComputeRequest compute_req = {
+    .op = HTP_OPS_MAT_MUL_PERMUTED_W4D16A32,
+  };
+  struct MatMulParams params = {
+    .output     = { .fd = output_fd,     .offset = 0, },
+    .activation = { .fd = activation_fd, .offset = 0, },
+    .weight     = { .fd = weight_fd,     .offset = 0, },
+    .m          = m,
+    .k          = k,
+    .n          = n,
+    .skip_scale = 0,
+  };
+
+  struct RequestHeader map_req_hdr = {
+    .state = 0,
+    .type  = REQUEST_TYPE_RPCMEM_MAP,
+  };
+  struct RpcmemMapRequest map_req = {
+    .n_puts = 3,
+    .n_gets = 0,
+  };
+
+  const size_t op_req_size  = sizeof(req_hdr) + sizeof(compute_req) + sizeof(params);
+  const size_t map_req_size = sizeof(map_req_hdr) + sizeof(map_req) + 3 * sizeof(int32_t);
+  msg->state.d        = 0;
+  msg->n_reqs         = 2;
+  msg->req_offsets[0] = message_header_size(msg);
+  msg->req_offsets[1] = msg->req_offsets[0] + op_req_size;
+  msg->req_offsets[2] = msg->req_offsets[1] + map_req_size;
+
+  uint8_t *p                  = (uint8_t *) message_header_get_request_ptr(msg, 0);
+  *(struct RequestHeader *) p = req_hdr;
+  p += sizeof(struct RequestHeader);
+  *(struct OpComputeRequest *) p = compute_req;
+  p += sizeof(struct OpComputeRequest);
+  *(struct MatMulParams *) p = params;
+
+  p = (uint8_t *) message_header_get_request_ptr(msg, 1);
+  *(struct RequestHeader *) p = map_req_hdr;
+  p += sizeof(struct RequestHeader);
+  *(struct RpcmemMapRequest *) p = map_req;
+  p += sizeof(struct RpcmemMapRequest);
+  *(int32_t *) p = output_fd;
+  p += sizeof(int32_t);
+  *(int32_t *) p = activation_fd;
+  p += sizeof(int32_t);
+  *(int32_t *) p = weight_fd;
+
+  __sync_synchronize();
+  int64_t t0      = get_time_us();
+  msg->state.v[0] = 1;
+  while (msg->state.v[1] != 1) {
+    if (get_time_us() - t0 > 10000000) {
+      fprintf(stderr, "%s: channel timeout for q4 m=%d k=%d n=%d\n", __func__, m, k, n);
+      goto end;
+    }
+    usleep(1);
+  }
+  int64_t elapsed_us = get_time_us() - t0;
+
+  int err = message_header_get_request_ptr(msg, 0)->state;
+  msg->state.d = 0;
+  if (err != 0) {
+    fprintf(stderr, "%s: channel op failed with %x for q4 m=%d k=%d n=%d\n", __func__, err, m, k, n);
+    goto end;
+  }
+
+  double sum_sq = 0.0;
+  float max_abs = 0.0f;
+  int n_failed = 0;
+  for (int i = 0; i < m * n; ++i) {
+    const float diff = fabsf(output[i] - output_ref[i]);
+    sum_sq += (double) diff * diff;
+    if (diff > max_abs) max_abs = diff;
+    if (diff > 2.0f) {
+      if (n_failed < 16) {
+        fprintf(stderr, "q4 mm mismatch #%d dsp=%g ref=%g diff=%g\n", i, output[i], output_ref[i], diff);
+      }
+      n_failed++;
+    }
+  }
+  const double rmse = sqrt(sum_sq / ((double) m * n));
+  passed = n_failed == 0 && rmse < 0.25 && max_abs < 2.0f;
+  fprintf(stderr,
+          "quant_mat_mul_q4_chan m=%d k=%d n=%d elapsed_us=%ld rmse=%g max_abs=%g failed=%d %s\n",
+          m, k, n, elapsed_us, rmse, max_abs, n_failed, passed ? "passed" : "failed");
+
+end:
+  if (weight_perm) free(weight_perm);
+  if (weight_deq_perm) free(weight_deq_perm);
+  if (output_ref) free(output_ref);
+  if (output) free_shared_mem_buf(output, output_fd, output_size);
+  if (activation) free_shared_mem_buf(activation, activation_fd, activation_size);
+  if (weight_q4) free_shared_mem_buf(weight_q4, weight_fd, weight_size);
+
+  return passed ? 0 : 1;
+}
+
+static int test_quant_mat_mul_chan(void *chan) {
+  int failed = 0;
+
+  const char *m_env = getenv("HTP_TEST_MM_M");
+  const char *k_env = getenv("HTP_TEST_MM_K");
+  const char *n_env = getenv("HTP_TEST_MM_N");
+  if (m_env || k_env || n_env) {
+    const int m = m_env ? atoi(m_env) : 128;
+    const int k = k_env ? atoi(k_env) : 256;
+    const int n = n_env ? atoi(n_env) : 1536;
+    failed += test_quant_mat_mul_chan_shape(chan, m, k, n);
+    fprintf(stderr, failed == 0 ? "%s passed\n" : "%s failed: %d shapes failed\n", __func__, failed);
+    return failed;
+  }
+
+  failed += test_quant_mat_mul_chan_shape(chan, 96, 256, 1536);
+  failed += test_quant_mat_mul_chan_shape(chan, 128, 256, 1536);
+  failed += test_quant_mat_mul_chan_shape(chan, 160, 256, 1536);
+  failed += test_quant_mat_mul_chan_shape(chan, 128, 1536, 1024);
+  failed += test_quant_mat_mul_chan_shape(chan, 128, 1536, 4096);
+
+  fprintf(stderr, failed == 0 ? "%s passed\n" : "%s failed: %d shapes failed\n", __func__, failed);
+  return failed;
 }
 
 int main(int argc, char **argv) {
@@ -752,12 +987,17 @@ int main(int argc, char **argv) {
       return 1;
     }
 
-    test_mat_mul_chan(chan);
+    int failed = 0;
+    if (getenv("HTP_TEST_QUANT_MATMUL")) {
+      failed = test_quant_mat_mul_chan(chan);
+    } else {
+      test_mat_mul_chan(chan);
+    }
 
     htp_ops_destroy_channel(get_global_handle());
     free_shared_mem_buf(chan, chan_fd, max_msg_size);
     close_dsp_session();
-    return 0;
+    return failed == 0 ? 0 : 1;
   }
 
   if (getenv("HTP_TEST_RMS_NORM")) {
@@ -810,12 +1050,12 @@ int main(int argc, char **argv) {
       return 1;
     }
 
-    test_flash_attn_chan(chan);
+    int failed = test_flash_attn_chan(chan);
 
     htp_ops_destroy_channel(get_global_handle());
     free_shared_mem_buf(chan, chan_fd, max_msg_size);
     close_dsp_session();
-    return 0;
+    return failed == 0 ? 0 : 1;
   }
 
   htp_ops_test_ops(get_global_handle());
