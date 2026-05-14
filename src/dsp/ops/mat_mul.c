@@ -884,10 +884,10 @@ int hmx_mat_mul_permuted_qk_0_d16a32(float *restrict dst, const float *restrict 
     return -1;
   }
 
-  // for large m, k (e.g. prefill FFN Down), use out-staionary version
-  if (m >= 128 && k > n && n > 1024) {
-    return mat_mul_qk_0_d16a32_out_stationary(dst, activation, permuted_weight, m, k, n, weight_type);
-  }
+  // The out-stationary path was intended for large prefill FFN down-projection
+  // shapes, but the common path is currently both correct and faster for the
+  // measured Q4_0 m>=128 cases. Keep it disabled until its DMA staging path is
+  // fixed and re-benchmarked.
 
   size_t super_block_size = get_super_block_size(weight_type);
   if (super_block_size == 0) {
@@ -1357,8 +1357,6 @@ int mat_mul_qk_0_d16a32_out_stationary(float *restrict out, const float *restric
 
         int64_t t0 = HAP_perf_get_qtimer_count();
         const float *activation_block = x + mr * k + kk;
-        // fetch activation block directly through the proven common conversion path.
-        // The previous 2D DMA staging path produced wrong results for m >= 128.
 
         // fetch weight block into VTCM
         {
@@ -1383,6 +1381,8 @@ int mat_mul_qk_0_d16a32_out_stationary(float *restrict out, const float *restric
         int64_t t1 = HAP_perf_get_qtimer_count();
         // load activation block
         {
+          // Fetch activation block directly through the proven common conversion path.
+          // The previous 2D DMA staging path produced wrong results for m >= 128.
           transfer_activation_chunk_fp32_to_fp16(vtcm_activation, activation_block, m_blk_sz, k_blk_sz, k);
         }
 
