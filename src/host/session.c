@@ -47,7 +47,7 @@ int open_dsp_session(int domain_id, int unsigned_pd_enabled) {
   uri_domain         = (char *) malloc(uri_domain_len);
   if (!uri_domain) {
     err = AEE_ENOMEMORY;
-    fprintf(stderr, "unable to allocated memory for uri_domain of size: %d", uri_domain_len);
+    fprintf(stderr, "unable to allocate memory for uri_domain of size: %d", uri_domain_len);
     goto bail;
   }
 
